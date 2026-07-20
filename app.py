@@ -310,9 +310,15 @@ def build_price_soc_figure(detail, prices, forecast):
                          showgrid=False, color=SOC_COL, row=row, col=1)
 
     if forecast_start is not None:
-        fig.add_vline(x=forecast_start, line_dash="dot", line_color="#999999",
-                      annotation_text="forecast →",
-                      annotation_font=dict(size=11, color="#888"))
+        # Epoch-ms x and a separate annotation: add_vline(annotation_text=...)
+        # with a datetime x raises TypeError on some plotly versions
+        # (plotly.py#4923), which would kill the whole callback.
+        x_ms = pd.Timestamp(forecast_start).value / 1e6
+        fig.add_vline(x=x_ms, line_dash="dot", line_color="#999999")
+        fig.add_annotation(x=forecast_start, xref="x", y=1, yref="y domain",
+                           text="forecast →", showarrow=False,
+                           xanchor="left", yanchor="bottom",
+                           font=dict(size=11, color="#888"))
 
     fig.update_xaxes(showgrid=True, gridcolor=GRID, ticks="outside",
                      tickformat="%H:%M\n%d %b", showline=True, linecolor="#cccccc")
