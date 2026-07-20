@@ -1,0 +1,5 @@
+oracledb
+pandas
+dash
+plotly
+python-dotenv
