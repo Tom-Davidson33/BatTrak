@@ -23,13 +23,16 @@ INTERVAL_HRS = 5.0 / 60.0  # 5-minute SCADA intervals
 #                One bad anchor point (a battery that never actually empties,
 #                or RTE drift over a long window) skews the whole trace.
 #
-#   "nempulse" — per nempulse.com.au/methodology + /glossary/soc: a running
-#                clamped integration. SOC is stepped interval-by-interval and
-#                saturated at 0 and at usable capacity as it goes, so every
-#                time a battery genuinely fills or empties the estimate
-#                re-anchors itself and accumulated drift is discarded. Seeded
-#                from NP_SEED_HOURS of history starting at 50% SOC; the level
-#                converges at the first saturation event.
+#   "nempulse" — per nempulse.com.au/methodology + /glossary/soc: AEMO
+#                publishes each unit's reported energy storage in
+#                DISPATCHLOAD.ENERGYSTORAGE (next-day public). Where a
+#                reported value exists it is used directly; beyond the last
+#                reported interval (i.e. today) SOC is stepped forward from
+#                that anchor by a running clamped integration of SCADA,
+#                saturated at 0 and usable capacity so genuine full/empty
+#                events re-anchor the estimate. If no reported data is
+#                available at all, falls back to the pure clamped integration
+#                seeded at 50% over NP_SEED_HOURS.
 #
 # Capacity is de-rated for age (calendar+cycle fade). Estimate only.
 
@@ -91,6 +94,31 @@ def get_scada(duids, as_at=None, lookback_hours=None):
     return df
 
 
+def get_reported_storage(duids, start, end):
+    """AEMO-reported unit energy storage (MWh) from next-day-public
+    DISPATCHLOAD. Empty frame if the column/table is unavailable."""
+    binds = {f"d{i}": d for i, d in enumerate(duids)}
+    placeholders = ",".join(f":{k}" for k in binds)
+    binds["start_dt"] = pd.Timestamp(start).to_pydatetime()
+    binds["end_dt"] = pd.Timestamp(end).to_pydatetime()
+    sql = f"""
+        SELECT SETTLEMENTDATE, DUID, ENERGYSTORAGE
+        FROM TESTER.DISPATCHLOAD
+        WHERE DUID IN ({placeholders})
+          AND SETTLEMENTDATE BETWEEN :start_dt AND :end_dt
+          AND INTERVENTION = 0
+          AND ENERGYSTORAGE IS NOT NULL
+        ORDER BY DUID, SETTLEMENTDATE
+    """
+    try:
+        df = query(sql, binds)
+    except Exception as exc:
+        print(f"get_reported_storage failed (falling back to integration): {exc}")
+        return pd.DataFrame(columns=["SETTLEMENTDATE", "DUID", "ENERGYSTORAGE"])
+    df.columns = [c.upper() for c in df.columns]
+    return df
+
+
 def _soc_min_anchor(mw, cap):
     """Legacy: shift so the window minimum is empty, then clip."""
     deltas = [(-v * INTERVAL_HRS) if v >= 0 else (-v * INTERVAL_HRS * RTE) for v in mw]
@@ -114,6 +142,32 @@ def _soc_clamped(mw, cap):
             level = 0.0
         elif level > cap:
             level = cap
+        out.append(level)
+    return out
+
+
+def _soc_hybrid(mw, cap, reported):
+    """AEMO-reported storage where published, clamped integration beyond it.
+
+    `reported` aligns with `mw` (NaN where no published value). A reported
+    value overrides the integration and re-anchors it; intervals after the
+    last reported point (typically today, before next-day publication) are
+    stepped forward from that anchor.
+    """
+    level = None
+    out = []
+    for v, rep in zip(mw, reported):
+        if rep == rep:  # not NaN
+            level = min(max(float(rep), 0.0), cap)
+        else:
+            if level is None:
+                level = 0.5 * cap
+            d = (-v * INTERVAL_HRS) if v >= 0 else (-v * INTERVAL_HRS * RTE)
+            level += d
+            if level < 0.0:
+                level = 0.0
+            elif level > cap:
+                level = cap
         out.append(level)
     return out
 
@@ -147,6 +201,18 @@ def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
     scada["BASE"] = scada["DUID"].map(base_map)
     netted = scada.groupby(["BASE", "SETTLEMENTDATE"], as_index=False)["SCADAVALUE"].sum()
 
+    # AEMO-reported storage (next-day public); split G/L units report the same
+    # store, so net by max rather than sum
+    rep_map = {}
+    if method == "nempulse":
+        start = ref - pd.Timedelta(hours=lookback_hours)
+        reported = get_reported_storage(bats["DUID"].tolist(), start, ref)
+        if not reported.empty:
+            reported["BASE"] = reported["DUID"].map(base_map)
+            rn = (reported.groupby(["BASE", "SETTLEMENTDATE"])["ENERGYSTORAGE"]
+                          .max())
+            rep_map = {b: s.droplevel(0) for b, s in rn.groupby(level=0)}
+
     rows = []
     for base, g in netted.groupby("BASE"):
         meta = grp.get(base)
@@ -156,7 +222,15 @@ def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
         g = g.sort_values("SETTLEMENTDATE").copy()
         mw = g["SCADAVALUE"].fillna(0.0).values
         if method == "nempulse":
-            soc = _soc_clamped(mw, cap)
+            rep = rep_map.get(base)
+            if rep is not None and len(rep):
+                # reported storage is ground truth: if it exceeds the derated
+                # capacity, the derate was too aggressive — lift the cap
+                cap = max(cap, float(rep.max()))
+                aligned = g["SETTLEMENTDATE"].map(rep).values
+                soc = _soc_hybrid(mw, cap, aligned)
+            else:
+                soc = _soc_clamped(mw, cap)
         else:
             soc = _soc_min_anchor(mw, cap)
         g["SOC_MWH"] = soc
@@ -193,3 +267,36 @@ def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
     disp = detail[detail["SETTLEMENTDATE"] >= cutoff].copy()
 
     return disp, summary
+
+
+def charge_discharge_prices(detail, prices):
+    """Volume-weighted average charge / discharge price over the window.
+
+    Returns (per_battery, per_state) frames with energy volumes, VWAPs and
+    the realised spread. Empty frames if either input is empty.
+    """
+    cols = ["BATTERY", "REGIONID", "CHG_MWH", "DIS_MWH",
+            "AVG_CHG", "AVG_DIS", "SPREAD"]
+    if detail.empty or prices.empty:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols[1:])
+
+    m = detail.merge(prices, on=["REGIONID", "SETTLEMENTDATE"], how="inner")
+    if m.empty:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols[1:])
+    mw = m["SCADAVALUE"].fillna(0.0)
+    m["CHG_MWH"] = (-mw).clip(lower=0) * INTERVAL_HRS   # energy drawn from grid
+    m["DIS_MWH"] = mw.clip(lower=0) * INTERVAL_HRS      # energy delivered
+    m["CHG_COST"] = m["CHG_MWH"] * m["RRP"]
+    m["DIS_REV"] = m["DIS_MWH"] * m["RRP"]
+
+    def _vwap(keys):
+        g = m.groupby(keys).agg(
+            CHG_MWH=("CHG_MWH", "sum"), DIS_MWH=("DIS_MWH", "sum"),
+            CHG_COST=("CHG_COST", "sum"), DIS_REV=("DIS_REV", "sum"),
+        ).reset_index()
+        g["AVG_CHG"] = (g["CHG_COST"] / g["CHG_MWH"]).where(g["CHG_MWH"] > 0)
+        g["AVG_DIS"] = (g["DIS_REV"] / g["DIS_MWH"]).where(g["DIS_MWH"] > 0)
+        g["SPREAD"] = g["AVG_DIS"] - g["AVG_CHG"]
+        return g.drop(columns=["CHG_COST", "DIS_REV"])
+
+    return _vwap(["BATTERY", "REGIONID"]), _vwap(["REGIONID"])

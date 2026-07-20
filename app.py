@@ -4,8 +4,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Dash, dcc, html, Input, Output
-from battery_soc import estimate_soc, NP_SEED_HOURS
+from dash import Dash, dcc, html, Input, Output, dash_table
+from battery_soc import estimate_soc, charge_discharge_prices, NP_SEED_HOURS
 from market import get_region_prices, get_p5min_forecast
 
 app = Dash(__name__)
@@ -29,11 +29,12 @@ app.layout = html.Div(
            "background": "#f7f8fa"},
     children=[
         html.H2("NEM Battery State of Charge \u2014 Estimated"),
-        html.P("Estimate only. Integrated from DISPATCH_UNIT_SCADA. Window anchors "
-               "pin the window minimum to empty (assumes \u22651 full cycle); the "
-               "NEMpulse method runs a continuously clamped integration that "
-               "re-anchors whenever a battery hits full or empty. Capacity "
-               "de-rated for age (2.5%/yr, floor 70%).",
+        html.P("Window anchors integrate DISPATCH_UNIT_SCADA and pin the window "
+               "minimum to empty (assumes \u22651 full cycle; estimate only). The "
+               "NEMpulse method uses AEMO's reported unit energy storage "
+               "(DISPATCHLOAD, next-day public) directly where available and "
+               "steps live SCADA forward from the last reported value, clamped "
+               "at empty/full. Capacity de-rated for age (2.5%/yr, floor 70%).",
                style={"color": "#555", "maxWidth": "900px"}),
         html.Div(id="last-update", style={"color": "#888", "fontSize": "12px"}),
 
@@ -88,11 +89,33 @@ app.layout = html.Div(
         dcc.Interval(id="refresh", interval=5 * 60 * 1000, n_intervals=0),
         dcc.Graph(id="duid-lines", style={"height": "820px"},
                   config={"displaylogo": False}),
-        dcc.Graph(id="capability-bar", config={"displaylogo": False}),
-        dcc.Graph(id="price-soc", style={"height": "1150px"},
-                  config={"displaylogo": False}),
+
+        dcc.Tabs(
+            style={"marginTop": "18px"},
+            children=[
+                dcc.Tab(label="Trading capability", children=[
+                    dcc.Graph(id="capability-bar", config={"displaylogo": False}),
+                ]),
+                dcc.Tab(label="Price vs avg SoC", children=[
+                    dcc.Graph(id="price-soc", style={"height": "1150px"},
+                              config={"displaylogo": False}),
+                ]),
+                dcc.Tab(label="Charge / discharge prices", children=[
+                    dcc.Graph(id="cd-price-bar", config={"displaylogo": False}),
+                    html.Div(id="cd-price-table",
+                             style={"maxWidth": "1100px", "margin": "0 0 24px 0"}),
+                ]),
+            ],
+        ),
     ],
 )
+
+
+def _cd_line(cd):
+    """Card line: window-average buy/sell prices, or a dash if unavailable."""
+    if not cd or cd["AVG_CHG"] != cd["AVG_CHG"] or cd["AVG_DIS"] != cd["AVG_DIS"]:
+        return "buy/sell VWAP: –"
+    return f"buy ${cd['AVG_CHG']:.0f}  |  sell ${cd['AVG_DIS']:.0f} /MWh"
 
 
 def compute_as_at(date_str, hour_val):
@@ -233,6 +256,85 @@ def build_capability_figure(summary):
     return fig
 
 
+CHG_COL = "#d62728"        # buying energy (cost) — matches 'absorb' red
+DIS_COL = "#2ca02c"        # selling energy (revenue) — matches 'deliver' green
+
+
+def build_cd_price_figure(per_state):
+    """State-level volume-weighted average charge vs discharge price."""
+    fig = go.Figure()
+    if not per_state.empty:
+        s = per_state.sort_values("REGIONID")
+        fig.add_trace(go.Bar(
+            y=s["REGIONID"], x=s["AVG_CHG"], orientation="h",
+            name="Avg charge price (buy)", marker_color=CHG_COL,
+            marker_line=dict(color="#9e1c1d", width=1),
+            text=[f"${v:,.0f}" if v == v else "–" for v in s["AVG_CHG"]],
+            textposition="outside", textfont=dict(size=11),
+            customdata=s["CHG_MWH"],
+            hovertemplate="<b>%{y}</b><br>Charged %{customdata:,.0f} MWh "
+                          "@ $%{x:,.0f}/MWh<extra></extra>",
+        ))
+        fig.add_trace(go.Bar(
+            y=s["REGIONID"], x=s["AVG_DIS"], orientation="h",
+            name="Avg discharge price (sell)", marker_color=DIS_COL,
+            marker_line=dict(color="#1d6f1d", width=1),
+            text=[f"${v:,.0f}" if v == v else "–" for v in s["AVG_DIS"]],
+            textposition="outside", textfont=dict(size=11),
+            customdata=s["DIS_MWH"],
+            hovertemplate="<b>%{y}</b><br>Discharged %{customdata:,.0f} MWh "
+                          "@ $%{x:,.0f}/MWh<extra></extra>",
+        ))
+    fig.update_layout(
+        title=dict(text="<b>Volume-Weighted Charge / Discharge Price by State</b>  "
+                        "<span style='font-size:13px;color:#888'>"
+                        "(displayed window; energy dispatch only, excludes FCAS)"
+                        "</span>",
+                   x=0.01, xanchor="left"),
+        barmode="group", height=420, font=FONT,
+        plot_bgcolor=PLOT_BG, paper_bgcolor=PAPER_BG,
+        xaxis=dict(title="<b>$/MWh</b>", showgrid=True, gridcolor=GRID,
+                   zeroline=True, zerolinecolor="#888888",
+                   ticks="outside", showline=True, linecolor="#cccccc"),
+        yaxis=dict(title="<b>Region</b>", showline=True, linecolor="#cccccc"),
+        margin=dict(l=80, r=60, t=70, b=60),
+        legend=dict(orientation="h", y=1.14, x=0, font=dict(size=12)),
+        bargap=0.25,
+    )
+    return fig
+
+
+def build_cd_price_table(per_batt):
+    """Sortable per-battery table of volumes, VWAPs and realised spread."""
+    if per_batt.empty:
+        return html.Div("No price data for this window.",
+                        style={"color": "#888", "padding": "12px"})
+    t = per_batt.sort_values(["REGIONID", "BATTERY"]).round(
+        {"CHG_MWH": 0, "DIS_MWH": 0, "AVG_CHG": 0, "AVG_DIS": 0, "SPREAD": 0})
+    return dash_table.DataTable(
+        data=t.to_dict("records"),
+        columns=[
+            {"name": "Battery", "id": "BATTERY"},
+            {"name": "Region", "id": "REGIONID"},
+            {"name": "Charged (MWh)", "id": "CHG_MWH"},
+            {"name": "Avg charge ($/MWh)", "id": "AVG_CHG"},
+            {"name": "Discharged (MWh)", "id": "DIS_MWH"},
+            {"name": "Avg discharge ($/MWh)", "id": "AVG_DIS"},
+            {"name": "Spread ($/MWh)", "id": "SPREAD"},
+        ],
+        sort_action="native",
+        style_as_list_view=True,
+        style_header={"fontWeight": "bold", "background": "#f3f3f3",
+                      "fontFamily": "Segoe UI, sans-serif", "fontSize": "13px"},
+        style_cell={"fontFamily": "Segoe UI, sans-serif", "fontSize": "13px",
+                    "padding": "6px 10px", "textAlign": "right"},
+        style_cell_conditional=[
+            {"if": {"column_id": c}, "textAlign": "left"}
+            for c in ("BATTERY", "REGIONID")
+        ],
+    )
+
+
 PRICE_COL = "#1f6feb"      # actual dispatch price
 FORECAST_COL = "#7fa8f5"   # P5MIN forecast (same hue, lighter, dashed)
 SOC_COL = "#2ca02c"        # matches 'dischargeable' green used elsewhere
@@ -352,6 +454,8 @@ def reset_live(_):
     Output("duid-lines", "figure"),
     Output("capability-bar", "figure"),
     Output("price-soc", "figure"),
+    Output("cd-price-bar", "figure"),
+    Output("cd-price-table", "children"),
     Output("last-update", "children"),
     Input("refresh", "n_intervals"),
     Input("as-at-date", "date"),
@@ -362,7 +466,7 @@ def update(_, as_at_date, as_at_hour, lookback):
     as_at = compute_as_at(as_at_date, as_at_hour)
     if lookback == "nempulse":
         method = "nempulse"
-        window_txt = f"NEMpulse clamped ({NP_SEED_HOURS // 24}d seed)"
+        window_txt = "NEMpulse (AEMO reported + live integration)"
         detail, summary = estimate_soc(as_at=as_at, method=method)
     else:
         lookback = int(lookback)
@@ -378,11 +482,14 @@ def update(_, as_at_date, as_at_hour, lookback):
 
     if detail.empty:
         empty = px.scatter(title="No data returned for this window")
-        return [html.Div("No data")], empty, empty, empty, stamp
+        return ([html.Div("No data")], empty, empty, empty, empty,
+                html.Div(), stamp)
 
     ref = pd.Timestamp.now() if as_at is None else pd.Timestamp(as_at)
     prices = get_region_prices(detail["SETTLEMENTDATE"].min(), ref)
     forecast = get_p5min_forecast(ref)
+    per_batt, per_state = charge_discharge_prices(detail, prices)
+    cd_map = per_state.set_index("REGIONID").to_dict("index") if not per_state.empty else {}
 
     cards = []
     for _, r in summary.iterrows():
@@ -400,12 +507,16 @@ def update(_, as_at_date, as_at_hour, lookback):
                          style={"fontSize": "12px", "color": "#555"}),
                 html.Div(f"deliver {r['DISCHARGE_HRS']:.1f}h  |  charge {r['CHARGE_HRS']:.1f}h",
                          style={"fontSize": "12px", "color": "#555"}),
+                html.Div(_cd_line(cd_map.get(r["REGIONID"])),
+                         style={"fontSize": "12px", "color": "#555"}),
                 html.Div(f"{int(r['N_UNITS'])} units",
                          style={"fontSize": "12px", "color": "#888"}),
             ]))
 
     return (cards, build_soc_figure(detail), build_capability_figure(summary),
-            build_price_soc_figure(detail, prices, forecast), stamp)
+            build_price_soc_figure(detail, prices, forecast),
+            build_cd_price_figure(per_state), build_cd_price_table(per_batt),
+            stamp)
 
 
 if __name__ == "__main__":
