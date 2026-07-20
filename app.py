@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dash import Dash, dcc, html, Input, Output, dash_table
-from battery_soc import estimate_soc, charge_discharge_prices, NP_SEED_HOURS
+from battery_soc import estimate_soc, charge_discharge_prices
 from market import get_region_prices, get_p5min_forecast
 
 app = Dash(__name__)
@@ -31,7 +31,7 @@ app.layout = html.Div(
         html.H2("NEM Battery State of Charge \u2014 Estimated"),
         html.P("Window anchors integrate DISPATCH_UNIT_SCADA and pin the window "
                "minimum to empty (assumes \u22651 full cycle; estimate only). The "
-               "NEMpulse method uses AEMO's reported unit energy storage "
+               "AEMO reported method uses each unit's reported energy storage "
                "(DISPATCHLOAD, next-day public) directly where available and "
                "steps live SCADA forward from the last reported value, clamped "
                "at empty/full. Capacity de-rated for age (2.5%/yr, floor 70%).",
@@ -70,9 +70,9 @@ app.layout = html.Div(
                         options=[
                             {"label": " 7 days", "value": 168},
                             {"label": " 48 hours", "value": 48},
-                            {"label": " NEMpulse method", "value": "nempulse"},
+                            {"label": " AEMO reported", "value": "reported"},
                         ],
-                        value="nempulse", inline=True,
+                        value="reported", inline=True,
                         labelStyle={"marginRight": "12px"}),
                 ]),
                 html.Button("Reset to live", id="reset-live", n_clicks=0,
@@ -464,9 +464,9 @@ def reset_live(_):
 )
 def update(_, as_at_date, as_at_hour, lookback):
     as_at = compute_as_at(as_at_date, as_at_hour)
-    if lookback == "nempulse":
-        method = "nempulse"
-        window_txt = "NEMpulse (AEMO reported + live integration)"
+    if lookback == "reported":
+        method = "reported"
+        window_txt = "AEMO reported + live integration"
         detail, summary = estimate_soc(as_at=as_at, method=method)
     else:
         lookback = int(lookback)

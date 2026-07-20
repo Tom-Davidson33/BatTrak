@@ -11,7 +11,7 @@ DISPLAY_HOURS = int(os.getenv("DISPLAY_HOURS", "48"))      # max chart window
 RTE = float(os.getenv("RTE", "0.88"))
 DEGRADE_PER_YEAR = float(os.getenv("DEGRADE_PER_YEAR", "0.025"))
 DEGRADE_FLOOR = float(os.getenv("DEGRADE_FLOOR", "0.70"))
-NP_SEED_HOURS = int(os.getenv("NP_SEED_HOURS", "336"))     # nempulse-method seed window
+SEED_HOURS = int(os.getenv("SEED_HOURS", "336"))   # reported-method seed window
 INTERVAL_HRS = 5.0 / 60.0  # 5-minute SCADA intervals
 
 # NOTE: AEMO does not publish state of charge. Both methods integrate net
@@ -23,7 +23,7 @@ INTERVAL_HRS = 5.0 / 60.0  # 5-minute SCADA intervals
 #                One bad anchor point (a battery that never actually empties,
 #                or RTE drift over a long window) skews the whole trace.
 #
-#   "nempulse" — per nempulse.com.au/methodology + /glossary/soc: AEMO
+#   "reported" — AEMO
 #                publishes each unit's reported energy storage in
 #                DISPATCHLOAD.ENERGYSTORAGE (next-day public). Where a
 #                reported value exists it is used directly; beyond the last
@@ -32,7 +32,7 @@ INTERVAL_HRS = 5.0 / 60.0  # 5-minute SCADA intervals
 #                saturated at 0 and usable capacity so genuine full/empty
 #                events re-anchor the estimate. If no reported data is
 #                available at all, falls back to the pure clamped integration
-#                seeded at 50% over NP_SEED_HOURS.
+#                seeded at 50% over SEED_HOURS.
 #
 # Capacity is de-rated for age (calendar+cycle fade). Estimate only.
 
@@ -127,7 +127,7 @@ def _soc_min_anchor(mw, cap):
 
 
 def _soc_clamped(mw, cap):
-    """NEMpulse-style running integration, saturated at [0, cap] each step.
+    """Running integration, saturated at [0, cap] each step.
 
     Starts at 50% of usable capacity; self-corrects to the true level the
     first time the unit hits full or empty, and re-anchors at every
@@ -175,7 +175,7 @@ def _soc_hybrid(mw, cap, reported):
 def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
     ref = pd.Timestamp.now() if as_at is None else pd.Timestamp(as_at)
     if lookback_hours is None:
-        lookback_hours = NP_SEED_HOURS if method == "nempulse" else LOOKBACK_HOURS
+        lookback_hours = SEED_HOURS if method == "reported" else LOOKBACK_HOURS
 
     bats = get_batteries()
     if bats.empty:
@@ -204,7 +204,7 @@ def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
     # AEMO-reported storage (next-day public); split G/L units report the same
     # store, so net by max rather than sum
     rep_map = {}
-    if method == "nempulse":
+    if method == "reported":
         start = ref - pd.Timedelta(hours=lookback_hours)
         reported = get_reported_storage(bats["DUID"].tolist(), start, ref)
         if not reported.empty:
@@ -221,7 +221,7 @@ def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
         cap = meta["CAPACITY_MWH"]
         g = g.sort_values("SETTLEMENTDATE").copy()
         mw = g["SCADAVALUE"].fillna(0.0).values
-        if method == "nempulse":
+        if method == "reported":
             rep = rep_map.get(base)
             if rep is not None and len(rep):
                 # reported storage is ground truth: if it exceeds the derated
