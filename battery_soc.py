@@ -94,6 +94,12 @@ def get_scada(duids, as_at=None, lookback_hours=None):
     return df
 
 
+# Candidate DISPATCHLOAD storage columns, most preferred first. ENERGY_STORAGE
+# (IESS name, end-of-interval) lines up exactly with the end-of-interval SOC
+# series; INITIAL_ENERGY_STORAGE (start of interval) is one interval behind.
+_STORAGE_COLS = ["ENERGY_STORAGE", "ENERGYSTORAGE", "INITIAL_ENERGY_STORAGE"]
+
+
 def get_reported_storage(duids, start, end):
     """AEMO-reported unit energy storage (MWh) from next-day-public
     DISPATCHLOAD. Empty frame if the column/table is unavailable."""
@@ -101,22 +107,26 @@ def get_reported_storage(duids, start, end):
     placeholders = ",".join(f":{k}" for k in binds)
     binds["start_dt"] = pd.Timestamp(start).to_pydatetime()
     binds["end_dt"] = pd.Timestamp(end).to_pydatetime()
-    sql = f"""
-        SELECT SETTLEMENTDATE, DUID, ENERGYSTORAGE
-        FROM TESTER.DISPATCHLOAD
-        WHERE DUID IN ({placeholders})
-          AND SETTLEMENTDATE BETWEEN :start_dt AND :end_dt
-          AND INTERVENTION = 0
-          AND ENERGYSTORAGE IS NOT NULL
-        ORDER BY DUID, SETTLEMENTDATE
-    """
-    try:
-        df = query(sql, binds)
-    except Exception as exc:
-        print(f"get_reported_storage failed (falling back to integration): {exc}")
-        return pd.DataFrame(columns=["SETTLEMENTDATE", "DUID", "ENERGYSTORAGE"])
-    df.columns = [c.upper() for c in df.columns]
-    return df
+    for col in _STORAGE_COLS:
+        sql = f"""
+            SELECT SETTLEMENTDATE, DUID, {col} AS ENERGYSTORAGE
+            FROM TESTER.DISPATCHLOAD
+            WHERE DUID IN ({placeholders})
+              AND SETTLEMENTDATE BETWEEN :start_dt AND :end_dt
+              AND INTERVENTION = 0
+              AND {col} IS NOT NULL
+            ORDER BY DUID, SETTLEMENTDATE
+        """
+        try:
+            df = query(sql, binds)
+        except Exception as exc:
+            print(f"get_reported_storage: {col} unavailable ({exc})")
+            continue
+        df.columns = [c.upper() for c in df.columns]
+        return df
+    print("get_reported_storage: no storage column found, "
+          "falling back to integration")
+    return pd.DataFrame(columns=["SETTLEMENTDATE", "DUID", "ENERGYSTORAGE"])
 
 
 def _soc_min_anchor(mw, cap):
