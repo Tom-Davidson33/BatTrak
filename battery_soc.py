@@ -11,11 +11,26 @@ DISPLAY_HOURS = int(os.getenv("DISPLAY_HOURS", "48"))      # max chart window
 RTE = float(os.getenv("RTE", "0.88"))
 DEGRADE_PER_YEAR = float(os.getenv("DEGRADE_PER_YEAR", "0.025"))
 DEGRADE_FLOOR = float(os.getenv("DEGRADE_FLOOR", "0.70"))
+NP_SEED_HOURS = int(os.getenv("NP_SEED_HOURS", "336"))     # nempulse-method seed window
 INTERVAL_HRS = 5.0 / 60.0  # 5-minute SCADA intervals
 
-# NOTE: AEMO does not publish state of charge. SoC is integrated from
-# SCADAVALUE over the chosen window ending at 'as_at'; the lowest point is
-# anchored to empty (assumes each battery hits ~0 at least once in the window).
+# NOTE: AEMO does not publish state of charge. Both methods integrate net
+# SCADAVALUE energy with charge efficiency RTE; they differ in how the
+# integral is anchored to an absolute level:
+#
+#   "anchor"   — legacy: cumulative sum over the lookback window, shifted so
+#                the window minimum sits at empty, then clipped to [0, cap].
+#                One bad anchor point (a battery that never actually empties,
+#                or RTE drift over a long window) skews the whole trace.
+#
+#   "nempulse" — per nempulse.com.au/methodology + /glossary/soc: a running
+#                clamped integration. SOC is stepped interval-by-interval and
+#                saturated at 0 and at usable capacity as it goes, so every
+#                time a battery genuinely fills or empties the estimate
+#                re-anchors itself and accumulated drift is discarded. Seeded
+#                from NP_SEED_HOURS of history starting at 50% SOC; the level
+#                converges at the first saturation event.
+#
 # Capacity is de-rated for age (calendar+cycle fade). Estimate only.
 
 
@@ -76,10 +91,37 @@ def get_scada(duids, as_at=None, lookback_hours=None):
     return df
 
 
-def estimate_soc(as_at=None, lookback_hours=None):
+def _soc_min_anchor(mw, cap):
+    """Legacy: shift so the window minimum is empty, then clip."""
+    deltas = [(-v * INTERVAL_HRS) if v >= 0 else (-v * INTERVAL_HRS * RTE) for v in mw]
+    cum = pd.Series(deltas).cumsum()
+    return (cum - cum.min()).clip(0, cap).values
+
+
+def _soc_clamped(mw, cap):
+    """NEMpulse-style running integration, saturated at [0, cap] each step.
+
+    Starts at 50% of usable capacity; self-corrects to the true level the
+    first time the unit hits full or empty, and re-anchors at every
+    subsequent saturation, so drift cannot accumulate.
+    """
+    level = 0.5 * cap
+    out = []
+    for v in mw:
+        d = (-v * INTERVAL_HRS) if v >= 0 else (-v * INTERVAL_HRS * RTE)
+        level += d
+        if level < 0.0:
+            level = 0.0
+        elif level > cap:
+            level = cap
+        out.append(level)
+    return out
+
+
+def estimate_soc(as_at=None, lookback_hours=None, method="anchor"):
     ref = pd.Timestamp.now() if as_at is None else pd.Timestamp(as_at)
     if lookback_hours is None:
-        lookback_hours = LOOKBACK_HOURS
+        lookback_hours = NP_SEED_HOURS if method == "nempulse" else LOOKBACK_HOURS
 
     bats = get_batteries()
     if bats.empty:
@@ -113,10 +155,11 @@ def estimate_soc(as_at=None, lookback_hours=None):
         cap = meta["CAPACITY_MWH"]
         g = g.sort_values("SETTLEMENTDATE").copy()
         mw = g["SCADAVALUE"].fillna(0.0).values
-        deltas = [(-v * INTERVAL_HRS) if v >= 0 else (-v * INTERVAL_HRS * RTE) for v in mw]
-        cum = pd.Series(deltas).cumsum()
-        soc = (cum - cum.min()).clip(0, cap)  # anchor trough to empty, clamp to cap
-        g["SOC_MWH"] = soc.values
+        if method == "nempulse":
+            soc = _soc_clamped(mw, cap)
+        else:
+            soc = _soc_min_anchor(mw, cap)
+        g["SOC_MWH"] = soc
         g["CAPACITY_MWH"] = cap
         g["POWER_MW"] = meta["POWER_MW"]
         g["REGIONID"] = meta["REGIONID"]

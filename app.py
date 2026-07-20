@@ -5,7 +5,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dash import Dash, dcc, html, Input, Output
-from battery_soc import estimate_soc
+from battery_soc import estimate_soc, NP_SEED_HOURS
+from market import get_region_prices, get_p5min_forecast
 
 app = Dash(__name__)
 app.title = "NEM Battery SoC Tracker (estimated)"
@@ -28,9 +29,11 @@ app.layout = html.Div(
            "background": "#f7f8fa"},
     children=[
         html.H2("NEM Battery State of Charge \u2014 Estimated"),
-        html.P("Estimate only. Integrated from DISPATCH_UNIT_SCADA, lowest point "
-               "anchored to empty (assumes \u22651 cycle). Capacity de-rated for "
-               "age (2.5%/yr, floor 70%).",
+        html.P("Estimate only. Integrated from DISPATCH_UNIT_SCADA. Window anchors "
+               "pin the window minimum to empty (assumes \u22651 full cycle); the "
+               "NEMpulse method runs a continuously clamped integration that "
+               "re-anchors whenever a battery hits full or empty. Capacity "
+               "de-rated for age (2.5%/yr, floor 70%).",
                style={"color": "#555", "maxWidth": "900px"}),
         html.Div(id="last-update", style={"color": "#888", "fontSize": "12px"}),
 
@@ -66,8 +69,9 @@ app.layout = html.Div(
                         options=[
                             {"label": " 7 days", "value": 168},
                             {"label": " 48 hours", "value": 48},
+                            {"label": " NEMpulse method", "value": "nempulse"},
                         ],
-                        value=168, inline=True,
+                        value="nempulse", inline=True,
                         labelStyle={"marginRight": "12px"}),
                 ]),
                 html.Button("Reset to live", id="reset-live", n_clicks=0,
@@ -85,6 +89,8 @@ app.layout = html.Div(
         dcc.Graph(id="duid-lines", style={"height": "820px"},
                   config={"displaylogo": False}),
         dcc.Graph(id="capability-bar", config={"displaylogo": False}),
+        dcc.Graph(id="price-soc", style={"height": "1150px"},
+                  config={"displaylogo": False}),
     ],
 )
 
@@ -227,6 +233,110 @@ def build_capability_figure(summary):
     return fig
 
 
+PRICE_COL = "#1f6feb"      # actual dispatch price
+FORECAST_COL = "#7fa8f5"   # P5MIN forecast (same hue, lighter, dashed)
+SOC_COL = "#2ca02c"        # matches 'dischargeable' green used elsewhere
+
+
+def build_price_soc_figure(detail, prices, forecast):
+    """Per-region price + average SoC overlay, with P5MIN forecast extension."""
+    regions = sorted(set(detail["REGIONID"].unique()) |
+                     set(prices["REGIONID"].unique() if not prices.empty else []))
+    n = len(regions)
+    fig = make_subplots(
+        rows=n, cols=1, shared_xaxes=True,
+        subplot_titles=[f"<b>{r}</b>" for r in regions],
+        vertical_spacing=0.045,
+        specs=[[{"secondary_y": True}] for _ in range(n)],
+    )
+
+    # State-average SoC time-series (energy-weighted across the fleet)
+    soc_ts = (detail.groupby(["REGIONID", "SETTLEMENTDATE"])
+                    .agg(STORED=("SOC_MWH", "sum"), CAP=("CAPACITY_MWH", "sum"))
+                    .reset_index())
+    soc_ts["PCT"] = 100.0 * soc_ts["STORED"] / soc_ts["CAP"]
+
+    forecast_start = None
+    if not forecast.empty:
+        forecast_start = forecast["RUN_DATETIME"].iloc[0]
+
+    for i, region in enumerate(regions):
+        row = i + 1
+        show = (i == 0)  # one legend entry per series type
+
+        p = prices[prices["REGIONID"] == region] if not prices.empty else prices
+        if not p.empty:
+            p = p.sort_values("SETTLEMENTDATE")
+            fig.add_trace(go.Scatter(
+                x=p["SETTLEMENTDATE"], y=p["RRP"],
+                mode="lines", name="Price (dispatch)",
+                line=dict(width=2, color=PRICE_COL),
+                legendgroup="price", showlegend=show,
+                hovertemplate="Price $%{y:,.0f}/MWh<extra></extra>",
+            ), row=row, col=1, secondary_y=False)
+
+        f = forecast[forecast["REGIONID"] == region] if not forecast.empty else forecast
+        if not f.empty:
+            f = f.sort_values("INTERVAL_DATETIME")
+            fx, fy = list(f["INTERVAL_DATETIME"]), list(f["RRP"])
+            if not p.empty:  # join the forecast onto the last actual point
+                fx = [p["SETTLEMENTDATE"].iloc[-1]] + fx
+                fy = [p["RRP"].iloc[-1]] + fy
+            fig.add_trace(go.Scatter(
+                x=fx, y=fy,
+                mode="lines", name="Price (P5MIN forecast)",
+                line=dict(width=2, color=FORECAST_COL, dash="dash"),
+                legendgroup="p5min", showlegend=show,
+                hovertemplate="P5MIN $%{y:,.0f}/MWh<extra></extra>",
+            ), row=row, col=1, secondary_y=False)
+
+        s = soc_ts[soc_ts["REGIONID"] == region]
+        if not s.empty:
+            s = s.sort_values("SETTLEMENTDATE")
+            fig.add_trace(go.Scatter(
+                x=s["SETTLEMENTDATE"], y=s["PCT"],
+                mode="lines", name="Avg SoC",
+                line=dict(width=2, color=SOC_COL),
+                legendgroup="soc", showlegend=show,
+                hovertemplate="Avg SoC %{y:.1f}%<extra></extra>",
+            ), row=row, col=1, secondary_y=True)
+
+        fig.update_yaxes(title_text="$/MWh", secondary_y=False,
+                         showgrid=True, gridcolor=GRID,
+                         zeroline=True, zerolinecolor="#bbbbbb",
+                         showline=True, linecolor="#cccccc", row=row, col=1)
+        fig.update_yaxes(title_text="SoC %", secondary_y=True,
+                         range=[0, 100], dtick=25, ticksuffix="%",
+                         showgrid=False, color=SOC_COL, row=row, col=1)
+
+    if forecast_start is not None:
+        # Epoch-ms x and a separate annotation: add_vline(annotation_text=...)
+        # with a datetime x raises TypeError on some plotly versions
+        # (plotly.py#4923), which would kill the whole callback.
+        x_ms = pd.Timestamp(forecast_start).value / 1e6
+        fig.add_vline(x=x_ms, line_dash="dot", line_color="#999999")
+        fig.add_annotation(x=forecast_start, xref="x", y=1, yref="y domain",
+                           text="forecast →", showarrow=False,
+                           xanchor="left", yanchor="bottom",
+                           font=dict(size=11, color="#888"))
+
+    fig.update_xaxes(showgrid=True, gridcolor=GRID, ticks="outside",
+                     tickformat="%H:%M\n%d %b", showline=True, linecolor="#cccccc")
+    fig.update_layout(
+        title=dict(text="<b>Regional Price vs Average BESS SoC</b>  "
+                        "<span style='font-size:13px;color:#888'>"
+                        "(solid blue = dispatch price, dashed = 5-min predispatch "
+                        "forecast, green = fleet-average SoC)</span>",
+                   x=0.01, xanchor="left"),
+        height=1150, font=FONT, plot_bgcolor=PLOT_BG, paper_bgcolor=PAPER_BG,
+        margin=dict(t=80, b=60, r=80, l=80),
+        legend=dict(orientation="h", y=1.03, x=0, font=dict(size=12),
+                    bordercolor="#e0e0e0", borderwidth=1, bgcolor="#fcfcfc"),
+        hovermode="x unified",
+    )
+    return fig
+
+
 @app.callback(
     Output("as-at-date", "date"),
     Output("as-at-hour", "value"),
@@ -241,6 +351,7 @@ def reset_live(_):
     Output("state-cards", "children"),
     Output("duid-lines", "figure"),
     Output("capability-bar", "figure"),
+    Output("price-soc", "figure"),
     Output("last-update", "children"),
     Input("refresh", "n_intervals"),
     Input("as-at-date", "date"),
@@ -249,10 +360,15 @@ def reset_live(_):
 )
 def update(_, as_at_date, as_at_hour, lookback):
     as_at = compute_as_at(as_at_date, as_at_hour)
-    lookback = int(lookback)
-    detail, summary = estimate_soc(as_at=as_at, lookback_hours=lookback)
+    if lookback == "nempulse":
+        method = "nempulse"
+        window_txt = f"NEMpulse clamped ({NP_SEED_HOURS // 24}d seed)"
+        detail, summary = estimate_soc(as_at=as_at, method=method)
+    else:
+        lookback = int(lookback)
+        window_txt = "7-day anchor" if lookback == 168 else "48h anchor"
+        detail, summary = estimate_soc(as_at=as_at, lookback_hours=lookback)
 
-    window_txt = "7-day anchor" if lookback == 168 else "48h anchor"
     if as_at is None:
         stamp = (f"Live \u2014 last refreshed: "
                  f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  {window_txt}")
@@ -262,7 +378,11 @@ def update(_, as_at_date, as_at_hour, lookback):
 
     if detail.empty:
         empty = px.scatter(title="No data returned for this window")
-        return [html.Div("No data")], empty, empty, stamp
+        return [html.Div("No data")], empty, empty, empty, stamp
+
+    ref = pd.Timestamp.now() if as_at is None else pd.Timestamp(as_at)
+    prices = get_region_prices(detail["SETTLEMENTDATE"].min(), ref)
+    forecast = get_p5min_forecast(ref)
 
     cards = []
     for _, r in summary.iterrows():
@@ -284,7 +404,8 @@ def update(_, as_at_date, as_at_hour, lookback):
                          style={"fontSize": "12px", "color": "#888"}),
             ]))
 
-    return cards, build_soc_figure(detail), build_capability_figure(summary), stamp
+    return (cards, build_soc_figure(detail), build_capability_figure(summary),
+            build_price_soc_figure(detail, prices, forecast), stamp)
 
 
 if __name__ == "__main__":
